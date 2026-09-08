@@ -1,0 +1,2 @@
+# nstanaliz
+analyzing nst 
