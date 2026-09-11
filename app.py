@@ -183,7 +183,7 @@ def extract_trace_from_mask(mask):
             trace[valid]
         )
 
-    return trace, quality
+    return trace, quality, valid
 
 
 def fallback_dark_trace(fhr_crop):
@@ -228,7 +228,7 @@ def fallback_dark_trace(fhr_crop):
             trace[valid]
         )
 
-    return trace, quality
+    return trace, quality, valid
 
 
 def convert_trace_to_bpm(trace_y, fhr_top_global, calibration, manual_offset_bpm=0.0):
@@ -243,13 +243,24 @@ def convert_trace_to_bpm(trace_y, fhr_top_global, calibration, manual_offset_bpm
     return bpm
 
 
-def robust_smooth(signal, window=3):
-    if window <= 1:
+def median_denoise(signal, window=3):
+    """
+    Tek kolon/piksel kaynaklı gürültüyü temizler.
+    Ortalama (mean) filtreden farklı olarak medyan filtre, akselerasyon
+    tepe değerlerini ve kısa dönem variability salınımlarının genliğini
+    düzleştirmeden gürültüyü azaltır; bu yüzden mean smoothing yerine
+    tercih edilir (mean smoothing amplitüdü sistematik olarak düşürüp
+    akselerasyon/variability'nin olduğundan az algılanmasına yol açıyordu).
+    """
+    signal = np.asarray(signal, dtype=float)
+    n = len(signal)
+    if window <= 1 or n == 0:
         return signal.copy()
 
-    kernel = np.ones(window) / window
-    padded = np.pad(signal, (window // 2, window // 2), mode="edge")
-    return np.convolve(padded, kernel, mode="valid")[:len(signal)]
+    pad = window // 2
+    padded = np.pad(signal, (pad, pad), mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, window)
+    return np.median(windows, axis=1)[:n]
 
 
 def calculate_baseline(fhr):
@@ -272,20 +283,43 @@ def calculate_baseline(fhr):
     return float(np.median(trimmed))
 
 
-def calculate_variability(fhr, baseline):
+def calculate_variability(fhr, baseline, seconds_per_pixel, exclude_mask=None):
     """
     Raster görüntüden yaklaşık variability tahmini.
+
+    Tüm trase için tek bir global P95-P5 genliği yerine ~1 dakikalık
+    pencerelerde genlik hesaplanıp medyanı alınır. Bu, hem bazal driftin
+    (uzun kayıtlarda bazalin kayması) variability'e karışmasını azaltır,
+    hem de klinik değerlendirmedeki kısa-dönem pencereleme mantığına
+    daha yakındır. Akselerasyon/deselerasyon olarak işaretlenmiş
+    aralıklar ve çizgi çıkarımının başarısız olup interpolasyonla
+    dolduğu (dolayısıyla yapay şekilde düz olan) kolonlar exclude_mask
+    ile hesaplamadan dışlanabilir.
+
     Klinik görsel değerlendirmeyi ikame etmez.
     """
-    valid = fhr[
-        np.isfinite(fhr) &
-        (np.abs(fhr - baseline) <= 15)
-    ]
+    signal = np.asarray(fhr, dtype=float)
+    n = len(signal)
 
-    if len(valid) < 30:
+    if exclude_mask is None:
+        exclude_mask = np.zeros(n, dtype=bool)
+
+    usable = np.isfinite(signal) & ~exclude_mask & (np.abs(signal - baseline) <= 25)
+
+    window_px = max(10, int(round(60.0 / seconds_per_pixel)))
+
+    window_amps = []
+    for start in range(0, n, window_px):
+        end = min(start + window_px, n)
+        seg = signal[start:end][usable[start:end]]
+        if len(seg) < max(10, int(window_px * 0.5)):
+            continue
+        window_amps.append(float(np.percentile(seg, 95) - np.percentile(seg, 5)))
+
+    if not window_amps:
         return None, "Değerlendirilemedi"
 
-    amplitude = float(np.percentile(valid, 95) - np.percentile(valid, 5))
+    amplitude = float(np.median(window_amps))
 
     if amplitude <= 2:
         label = "Absent"
@@ -297,6 +331,22 @@ def calculate_variability(fhr, baseline):
         label = "Marked"
 
     return amplitude, label
+
+
+def build_exclusion_mask(n, extraction_valid, events, margin_px=3):
+    """
+    Variability hesabından dışlanacak kolonları işaretler:
+    - çizgi çıkarımı başarısız olup interpolasyonla düzleştirilmiş kolonlar
+    - akselerasyon/deselerasyon olarak tespit edilen aralıklar (± küçük bir pay ile)
+    """
+    mask = ~np.asarray(extraction_valid, dtype=bool)
+
+    for event in events:
+        start = max(0, event["start"] - margin_px)
+        end = min(n - 1, event["end"] + margin_px)
+        mask[start:end + 1] = True
+
+    return mask
 
 
 def find_regions(mask):
@@ -989,15 +1039,16 @@ if uploaded_file is not None:
         calibration = get_hospital_calibration(image)
 
         purple_mask = purple_trace_mask(fhr_crop)
-        trace_y, quality = extract_trace_from_mask(purple_mask)
+        trace_y, quality, extraction_valid = extract_trace_from_mask(purple_mask)
         extraction_method = "Mor FHR çizgi segmentasyonu"
 
         if quality < 0.45:
-            trace_y_fallback, fallback_quality = fallback_dark_trace(fhr_crop)
+            trace_y_fallback, fallback_quality, fallback_valid = fallback_dark_trace(fhr_crop)
 
             if fallback_quality > quality:
                 trace_y = trace_y_fallback
                 quality = fallback_quality
+                extraction_valid = fallback_valid
                 extraction_method = "Koyu çizgi fallback"
 
         if quality < 0.35:
@@ -1014,7 +1065,10 @@ if uploaded_file is not None:
             manual_offset_bpm=manual_offset_bpm,
         )
 
-        fhr = robust_smooth(fhr, window=3)
+        # Yalnızca kolon/piksel gürültüsünü temizler; medyan filtre kullanılır
+        # çünkü ortalama (mean) filtre akselerasyon tepe genliğini ve variability
+        # salınımlarını sistematik olarak düşürüp altında kalmalarına yol açıyordu.
+        fhr = median_denoise(fhr, window=3)
 
         # Aşırı uçları rapor öncesi kontrol et
         plausible_fraction = np.mean((fhr >= 70) & (fhr <= 210))
@@ -1031,8 +1085,6 @@ if uploaded_file is not None:
         if baseline is None:
             st.error("❌ Bazal FHR hesaplanamadı.")
             st.stop()
-
-        variability_amp, variability = calculate_variability(fhr, baseline)
 
         # Zaman kalibrasyonu tüm export görüntüsündeki aynı piksel ölçeğini kullanır.
         seconds_per_pixel = calibration["seconds_per_pixel"]
@@ -1057,6 +1109,22 @@ if uploaded_file is not None:
             direction="down",
             amplitude_threshold=15.0,
             duration_threshold=15.0,
+        )
+
+        # Variability hesabı akselerasyon/deselerasyon aralıklarını ve çizgi
+        # çıkarımının başarısız olup interpolasyonla düzleştirildiği kolonları
+        # dışlar; aksi hâlde bu bölümler variability'i yapay şekilde azaltıyordu.
+        exclude_mask = build_exclusion_mask(
+            len(fhr),
+            extraction_valid,
+            accelerations + decelerations,
+        )
+
+        variability_amp, variability = calculate_variability(
+            fhr,
+            baseline,
+            seconds_per_pixel,
+            exclude_mask=exclude_mask,
         )
 
         total_minutes = len(fhr) * seconds_per_pixel / 60.0
